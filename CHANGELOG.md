@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Generation-owned startup readiness
+
+- `spawnDaemon` and `pty run` can arm a daemon-owned startup lease. PTY
+  publishes one lifecycle tag containing the opaque generation, host boot
+  identity, and absolute monotonic deadline before detached spawn returns.
+  Caller exit cannot disarm or extend the deadline. Only a current-generation
+  live-daemon compare-and-set away from the exact starting value disarms it.
+  At expiry, complete frozen child containment records terminal cause
+  `deadline` before exact teardown. An unavailable or partial process-table
+  observation records `teardown-unavailable` instead, best-effort signals
+  observed exact identities plus the root process group, and preserves exit
+  evidence without claiming exact containment. Startup-lease generations retain
+  their terminal lifecycle and exit evidence through natural child/daemon exit
+  for generation-fenced consumption.
+- The public client and machine CLI now expose typed accepted-socket ownership
+  for an exact held TCP 4-tuple and generation. Linux uses complete procfs
+  socket/descriptor tables; package production builds one universal Darwin
+  `libproc` helper for arm64 and x86_64, while source installs may fall back to
+  a best-effort local build without making a compiler an install requirement.
+  Inspection runs off the daemon event loop.
+  Results distinguish `Owned`, `NotOwned`, and `Unavailable`; incomplete,
+  scoped, or changing observations fail closed.
+- `compareAndSetLifecycle` / `pty readiness cas` provide the matching
+  generation-fenced one-tag CAS so stale readiness or terminal completions
+  cannot overwrite a replacement generation.
+
 ### `pty metadata patch` waits out the attach window
 
 - An attached child starts while `pty run` still holds the per-session

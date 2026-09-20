@@ -8,6 +8,7 @@ import {
   validateDisplayName,
   hasProcessExitedForReap,
 } from "./sessions.ts";
+import type { StartupLeaseOptions } from "./startup-lease.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -102,6 +103,8 @@ export interface SpawnDaemonOptions {
   /** @internal PID owning an already-held per-name creation lock. Used only
    *  when a lifecycle operation must keep its CAS lock across CLI fallback. */
   creationLockOwnerPid?: number;
+  /** Daemon-owned startup deadline, published as a generation-fenced lifecycle tag. */
+  startupLease?: StartupLeaseOptions;
 }
 
 /** Default time we wait for a daemon's Unix socket to appear after
@@ -182,6 +185,7 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
     ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
     ...(options.unsetEnv && options.unsetEnv.length > 0 ? { unsetEnv: options.unsetEnv } : {}),
     ...(options.env ? { env: options.env } : {}),
+    ...(options.startupLease ? { startupLease: options.startupLease } : {}),
   });
 
   const launcherCmd = options.launcher?.command ?? process.execPath;
@@ -316,8 +320,8 @@ function hasPublishedSessionStart(name: string, createdAt: string): boolean {
  * Only the inputs that the CLI surface supports are passed through. Initial
  * size, an alternate display command, an exact replacement env, and a custom
  * launcher remain Node-path-only; the restart-relevant CLI settings
- * (ephemeral, cwd, display name, tags, isolation, env overlay, and env
- * removal) all have lossless flag equivalents.
+ * (ephemeral, cwd, display name, tags, isolation, env overlay, env removal,
+ * and startup lease) all have lossless flag equivalents.
  *
  * `isolateEnv` maps to `--isolate-env`. `cwd` to `--cwd`. `tags` to
  * repeated `--tag k=v`. `name` to `--id` (the on-disk identifier under the
@@ -349,6 +353,10 @@ function spawnViaCli(options: SpawnDaemonOptions): Promise<void> {
     for (const [k, v] of Object.entries(options.tags)) {
       cliArgs.push("--tag", `${k}=${v}`);
     }
+  }
+  if (options.startupLease) {
+    cliArgs.push("--startup-timeout-ms", String(options.startupLease.timeoutMs));
+    cliArgs.push("--lifecycle-tag", options.startupLease.lifecycleTag);
   }
   cliArgs.push("--", options.command, ...options.args);
 

@@ -5,7 +5,7 @@ _pty() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="run attach a exec peek send events list ls stats restart kill recover rm remove gc tag tag-multi emit rename metadata evidence up down test remote-serve"
+  commands="run attach a exec peek send events list ls stats restart kill recover rm remove gc tag tag-multi emit rename metadata readiness evidence up down test remote-serve"
 
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     if [[ "${cur}" == -* ]]; then
@@ -24,7 +24,7 @@ _pty() {
 
   case "${COMP_WORDS[1]}" in
     run)
-      COMPREPLY=($(compgen -W "-d --detach -a --attach -e --ephemeral --id --name --no-display-name --tag --env --unset-env --cwd --isolate-env --force" -- "${cur}"))
+      COMPREPLY=($(compgen -W "-d --detach -a --attach -e --ephemeral --id --name --no-display-name --tag --env --unset-env --cwd --isolate-env --force --startup-timeout-ms --lifecycle-tag" -- "${cur}"))
       ;;
     attach|a)
       if [[ "${prev}" == "--attach-stream-fd-v1" ]]; then
@@ -127,6 +127,30 @@ _pty() {
       ;;
     metadata)
       COMPREPLY=($(compgen -W "--id" -- "${cur}"))
+      ;;
+    readiness)
+      if [[ ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "ownership cas" -- "${cur}"))
+        return
+      fi
+      case "${COMP_WORDS[2]}" in
+        ownership)
+          if [[ "${prev}" == "--id" ]]; then
+            return
+          fi
+          if [[ "${cur}" == -* ]]; then
+            COMPREPLY=($(compgen -W "--id" -- "${cur}"))
+          fi
+          ;;
+        cas)
+          if [[ "${prev}" == "--id" ]]; then
+            return
+          fi
+          if [[ "${cur}" == -* ]]; then
+            COMPREPLY=($(compgen -W "--id" -- "${cur}"))
+          fi
+          ;;
+      esac
       ;;
     evidence)
       if [[ ${COMP_CWORD} -eq 2 ]]; then

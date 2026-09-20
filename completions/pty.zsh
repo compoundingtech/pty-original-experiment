@@ -35,6 +35,7 @@ _pty() {
     'emit:Publish a user.* event'
     'rename:Set / show / clear displayName'
     'metadata:Atomically patch presentation metadata by stable id'
+    'readiness:Exact socket ownership and lifecycle compare-and-set'
     'evidence:Read or remove exact-generation retained exit evidence'
     'up:Start sessions from pty.toml'
     'down:Stop sessions from pty.toml'
@@ -68,7 +69,9 @@ _pty() {
             '--unset-env[Remove inherited environment key (repeatable)]' \
             '--cwd[Working directory]' \
             '--isolate-env[Scrub env to a safe allow-list]' \
-            '--force[Create even from inside another pty]'
+            '--force[Create even from inside another pty]' \
+            '--startup-timeout-ms[Daemon-owned startup deadline in milliseconds]:milliseconds:' \
+            '--lifecycle-tag[Generation-fenced lifecycle tag key]:key:'
           ;;
         attach|a)
           _arguments \
@@ -185,6 +188,22 @@ _pty() {
           _arguments \
             '--id[Exact stable session id]' \
             '1:mode:(patch)'
+          ;;
+        readiness)
+          if (( CURRENT == 3 )); then
+            _values 'operation' ownership cas
+          else
+            case ${words[2]} in
+              ownership)
+                _arguments \
+                  '--id[Exact stable session id]:id:'
+                ;;
+              cas)
+                _arguments \
+                  '--id[Exact stable session id]:id:'
+                ;;
+            esac
+          fi
           ;;
         evidence)
           if (( CURRENT == 3 )); then

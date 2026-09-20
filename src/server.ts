@@ -18,7 +18,15 @@ import {
   encodeScreen,
   encodeStatusResponse,
   encodeGeometry,
+  encodeAcceptedSocketOwnershipResponse,
+  encodeLifecycleCompareAndSetResponse,
+  decodeAcceptedSocketOwnershipRequest,
+  decodeLifecycleCompareAndSetRequest,
   decodeSize,
+  type AcceptedSocketOwnershipRequest,
+  type AcceptedSocketOwnershipResult,
+  type LifecycleCompareAndSetRequest,
+  type LifecycleCompareAndSetResult,
 } from "./protocol.ts";
 import {
   getSocketPath,
@@ -31,6 +39,7 @@ import {
   writeMetadata,
   readMetadata,
   mutateMetadataUnderLock,
+  compareAndSetTagValue,
   shouldReapAtExit,
   reapOnExitDefault,
   SESSION_EXIT_LAST_LINES_LIMIT,
@@ -66,11 +75,24 @@ import {
 } from "./recovery.ts";
 import type { StatsResult } from "./client.ts";
 import {
+  freezeDescendantProcesses,
   signalProcessIdentities,
-  snapshotDescendantProcesses,
+  snapshotDescendantProcessesComplete,
+  terminateProcessGroup,
   terminateProcessIdentities,
   type ProcessIdentity,
 } from "./process-tree.ts";
+import { inspectAcceptedSocketOwnershipAsync } from "./socket-ownership.ts";
+import {
+  armStartupLease,
+  startupLeaseDeadlineCause,
+  remainingLeaseDelayMs,
+  systemMonotonicClock,
+  terminalStartupLeaseValue,
+  type ArmedStartupLease,
+  type StartupLeaseOptions,
+  type StartupLeaseTerminalCause,
+} from "./startup-lease.ts";
 
 interface Client {
   socket: net.Socket;
@@ -88,6 +110,17 @@ interface Client {
     packet: Buffer;
   }>;
 }
+
+const jsonRecord = (payload: Buffer): Record<string, unknown> | undefined => {
+  try {
+    const value: unknown = JSON.parse(payload.toString("utf8"));
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 export interface ServerOptions {
   name: string;
@@ -126,6 +159,11 @@ export interface ServerOptions {
    *  the caller wants total control of the child environment (e.g., a
    *  launcher shell that injects a shim tmux on `PATH`). */
   env?: Record<string, string>;
+  /** Optional daemon-owned hard startup deadline. The daemon publishes the
+   *  generation, boot identity, and absolute monotonic deadline in this tag. */
+  startupLease?: StartupLeaseOptions;
+  /** Called only after the current generation wins the deadline transition. */
+  onStartupLeaseDeadline?: () => void;
 }
 
 /** Env variables that are safe to pass through to a session child when
@@ -319,12 +357,22 @@ export class PtyServer {
   private lastResizeTime = 0;
   private eventWriter: EventWriter;
   private generation: string;
+  private startupLease: ArmedStartupLease | null = null;
+  private startupLeaseTimer: NodeJS.Timeout | null = null;
+  private startupLeaseDisarmed = false;
+  private startupLeaseTerminalCause: StartupLeaseTerminalCause | null = null;
+  private startupLeaseDeadlineNotified = false;
+  private startupLeaseDeadlineNotificationPending = false;
+  private startupLeaseDeadlineResponseReleased = false;
+  private startupLeaseTerminalValue: string | null = null;
   private recoveryCapability: RecoveryCapability | null = null;
   private recoveryRoot = "";
   private recoveryInFlight = false;
   private recoveryWatcher: fs.FSWatcher | null = null;
   private lastTitle = "";
   private shutdownDescendants: ProcessIdentity[] = [];
+  private shutdownTreeUnavailable: string | null = null;
+  private shutdownTreeSnapshotted = false;
   readonly ready: Promise<void>;
   // Resolves when the child process's onExit has fired — used by close() to
   // make sure session_exit has been queued to the event chain before we
@@ -336,6 +384,9 @@ export class PtyServer {
     this.name = options.name;
     this.options = options;
     this.generation = options.generation ?? randomBytes(16).toString("hex");
+    if (options.startupLease) {
+      this.startupLease = armStartupLease(options.startupLease, this.generation);
+    }
     this.eventWriter = new EventWriter(options.name);
     this.childExited = new Promise<void>((resolve) => {
       this.resolveChildExited = resolve;
@@ -596,6 +647,7 @@ export class PtyServer {
       // nonzero `signal` and often exitCode 0 — if we recorded only the raw
       // exitCode, a killed process would look like a clean finish and any
       // consumer gating on "nonzero exit" (convoy's crash→ding) would miss it.
+      this.settleStartupLease("exit");
       // Surface it the way a shell does: 128 + signal (SIGKILL 9 → 137).
       const code = signal ? 128 + signal : exitCode;
       this.exitCode = code;
@@ -673,6 +725,13 @@ export class PtyServer {
       });
       this.socketServer.listen(socketPath, () => {
         try { fs.chmodSync(socketPath, 0o600); } catch {}
+        const publishedTags: Record<string, string> = Object.assign(
+          Object.create(null),
+          options.tags ?? {},
+        );
+        if (this.startupLease) {
+          publishedTags[this.startupLease.lifecycleTag] = this.startupLease.startingValue;
+        }
         writeMetadata(this.name, {
           generation: this.generation,
           daemonPid: process.pid,
@@ -685,7 +744,7 @@ export class PtyServer {
           cols: options.cols,
           ephemeral: options.ephemeral === true,
           createdAt: new Date().toISOString(),
-          ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
+          ...(Object.keys(publishedTags).length > 0 ? { tags: publishedTags } : {}),
           ...(options.displayName ? { displayName: options.displayName } : {}),
           ...(options.isolateEnv ? { isolateEnv: true } : {}),
           ...(options.extraEnv && Object.keys(options.extraEnv).length > 0 ? { extraEnv: options.extraEnv } : {}),
@@ -693,8 +752,10 @@ export class PtyServer {
           ...(options.env ? { env: options.env } : {}),
         });
         this.emitEvent(EventType.SESSION_START, {
-          ...(options.tags && Object.keys(options.tags).length > 0 ? { tags: options.tags } : {}),
+          ...(Object.keys(publishedTags).length > 0 ? { tags: publishedTags } : {}),
         });
+        if (this.exited) this.settleStartupLease("exit");
+        else this.scheduleStartupLeaseDeadline();
         if (settled) return;
         settled = true;
         resolve();
@@ -922,6 +983,226 @@ export class PtyServer {
     }
   }
 
+  private scheduleStartupLeaseDeadline(retryMs?: number): void {
+    if (!this.startupLease || this.startupLeaseDisarmed) return;
+    clearTimeout(this.startupLeaseTimer ?? undefined);
+    const delay = retryMs ?? remainingLeaseDelayMs(
+      this.startupLease.deadlineMonotonicNs,
+      systemMonotonicClock.nowNs(),
+    );
+    this.startupLeaseTimer = setTimeout(() => {
+      this.startupLeaseTimer = null;
+      if (!this.startupLease || this.startupLeaseDisarmed) return;
+      const remaining = remainingLeaseDelayMs(
+        this.startupLease.deadlineMonotonicNs,
+        systemMonotonicClock.nowNs(),
+      );
+      if (remaining > 0) {
+        this.scheduleStartupLeaseDeadline();
+        return;
+      }
+      this.settleStartupLeaseDeadline();
+    }, delay);
+  }
+
+  private settleStartupLeaseDeadline(notify = true): string | undefined {
+    if (!this.shutdownTreeSnapshotted) {
+      const snapshot = freezeDescendantProcesses(this.ptyProcess.pid);
+      this.shutdownTreeSnapshotted = true;
+      this.shutdownDescendants = snapshot.identities;
+      if (snapshot._tag === "Unavailable") {
+        this.shutdownTreeUnavailable = snapshot.reason;
+        console.error(
+          `pty daemon "${this.name}": complete child containment unavailable: ${snapshot.reason}; ` +
+          `publishing teardown-unavailable and exact-signalling ` +
+          `${snapshot.identities.length} observed descendant(s) plus process-group fallback`,
+        );
+      }
+    }
+    return this.settleStartupLease(startupLeaseDeadlineCause(
+      this.shutdownTreeUnavailable === null,
+    ), notify);
+  }
+
+  private resumePreparedDeadlineTeardown(): void {
+    try { process.kill(-this.ptyProcess.pid, "SIGCONT"); } catch {}
+    try { this.ptyProcess.kill("SIGCONT"); } catch {}
+    signalProcessIdentities(this.shutdownDescendants, "SIGCONT");
+  }
+
+  private releaseStartupLeaseDeadlineResponse(): void {
+    this.startupLeaseDeadlineResponseReleased = true;
+    this.notifyStartupLeaseDeadline();
+  }
+
+  private notifyStartupLeaseDeadline(): void {
+    if (
+      !this.startupLeaseDeadlineNotificationPending ||
+      this.startupLeaseDeadlineNotified
+    ) return;
+    this.startupLeaseDeadlineNotificationPending = false;
+    this.startupLeaseDeadlineNotified = true;
+    this.options.onStartupLeaseDeadline?.();
+  }
+
+  private settleStartupLease(
+    cause: StartupLeaseTerminalCause,
+    notify = true,
+  ): string | undefined {
+    const lease = this.startupLease;
+    const effectiveCause = cause === "exit"
+      ? this.startupLeaseTerminalCause ?? cause
+      : cause;
+    this.startupLeaseTerminalCause = effectiveCause;
+    if (!lease) return undefined;
+    if (this.startupLeaseTerminalValue !== null) return this.startupLeaseTerminalValue;
+    const terminalValue = terminalStartupLeaseValue(this.generation, effectiveCause);
+    const result = mutateMetadataUnderLock(this.name, (metadata) => {
+      if (metadata.tags?.[lease.lifecycleTag] === terminalValue) return false;
+      metadata.tags = { ...metadata.tags, [lease.lifecycleTag]: terminalValue };
+      return true;
+    }, { expectedGeneration: this.generation });
+    if (result.status === "changed" || result.status === "unchanged") {
+      this.startupLeaseDisarmed = true;
+      clearTimeout(this.startupLeaseTimer ?? undefined);
+      this.startupLeaseTimer = null;
+      this.startupLeaseTerminalValue = terminalValue;
+      if (effectiveCause !== "exit") {
+        this.startupLeaseDeadlineNotificationPending = true;
+        if (notify || this.startupLeaseDeadlineResponseReleased) {
+          this.notifyStartupLeaseDeadline();
+        }
+      }
+    } else if (
+      result.status === "busy" || result.status === "stale" || result.status === "missing"
+    ) {
+      clearTimeout(this.startupLeaseTimer ?? undefined);
+      this.startupLeaseTimer = setTimeout(() => {
+        this.startupLeaseTimer = null;
+        this.settleStartupLease(effectiveCause, notify);
+      }, 10);
+    } else if (result.status === "generation-mismatch") {
+      this.startupLeaseDisarmed = true;
+      if (cause !== "exit" && this.shutdownTreeSnapshotted) {
+        this.resumePreparedDeadlineTeardown();
+      }
+      clearTimeout(this.startupLeaseTimer ?? undefined);
+      this.startupLeaseTimer = null;
+    }
+    return terminalValue;
+  }
+
+  private async acceptedSocketOwnership(
+    request: AcceptedSocketOwnershipRequest,
+  ): Promise<AcceptedSocketOwnershipResult> {
+    if (request.expectedGeneration !== this.generation) {
+      return { _tag: "Unavailable", reason: "generation-mismatch" };
+    }
+    if (this.exited) return { _tag: "Unavailable", reason: "child-exited" };
+    const before = readMetadata(this.name);
+    if (!before) return { _tag: "Unavailable", reason: "metadata-unavailable" };
+    if (before.generation !== this.generation) {
+      return { _tag: "Unavailable", reason: "generation-mismatch" };
+    }
+    const result = await inspectAcceptedSocketOwnershipAsync(
+      this.ptyProcess.pid,
+      request.connection,
+    );
+    if (this.exited || this.startupLeaseDeadlineNotified) {
+      return { _tag: "Unavailable", reason: "child-exited" };
+    }
+    const after = readMetadata(this.name);
+    if (!after) return { _tag: "Unavailable", reason: "metadata-unavailable" };
+    return after.generation === this.generation
+      ? result
+      : { _tag: "Unavailable", reason: "generation-mismatch" };
+  }
+
+  private compareAndSetLifecycle(
+    request: LifecycleCompareAndSetRequest,
+  ): LifecycleCompareAndSetResult {
+    if (request.expectedGeneration !== this.generation) {
+      return { _tag: "GenerationMismatch" };
+    }
+    const current = readMetadata(this.name);
+    if (!current) return { _tag: "Missing" };
+    if (current.generation !== this.generation) {
+      return { _tag: "GenerationMismatch" };
+    }
+    if (this.exited) {
+      const value = this.settleStartupLease("exit") ??
+        terminalStartupLeaseValue(this.generation, "exit");
+      const after = readMetadata(this.name);
+      if (!after) return { _tag: "Missing" };
+      if (after.generation !== this.generation) {
+        return { _tag: "GenerationMismatch" };
+      }
+      return { _tag: "Terminal", value };
+    }
+    const lease = this.startupLease;
+    if (
+      lease &&
+      !this.startupLeaseDisarmed &&
+      systemMonotonicClock.nowNs() >= BigInt(lease.deadlineMonotonicNs)
+    ) {
+      this.settleStartupLeaseDeadline(false);
+      const after = readMetadata(this.name);
+      if (!after) return { _tag: "Missing" };
+      if (after.generation !== this.generation) {
+        return { _tag: "GenerationMismatch" };
+      }
+      const value = after.tags?.[lease.lifecycleTag];
+      return value === undefined
+        ? { _tag: "ValueMismatch" }
+        : { _tag: "DeadlineExpired", value };
+    }
+
+    const result = compareAndSetTagValue(
+      this.name,
+      request.expectedGeneration,
+      request.tag,
+      request.expectedValue,
+      request.value,
+    );
+    if (result.status === "changed" || result.status === "unchanged") {
+      if (
+        lease &&
+        request.tag === lease.lifecycleTag &&
+        request.expectedValue === lease.startingValue &&
+        request.value !== lease.startingValue
+      ) {
+        this.startupLeaseDisarmed = true;
+        clearTimeout(this.startupLeaseTimer ?? undefined);
+        this.startupLeaseTimer = null;
+      }
+      if (lease && request.tag === lease.lifecycleTag) {
+        try {
+          const lifecycle: unknown = JSON.parse(request.value);
+          if (
+            typeof lifecycle === "object" &&
+            lifecycle !== null &&
+            !Array.isArray(lifecycle) &&
+            (lifecycle as Record<string, unknown>)._tag === "terminal" &&
+            (lifecycle as Record<string, unknown>).generation === this.generation
+          ) {
+            this.startupLeaseTerminalValue = request.value;
+          }
+        } catch {}
+      }
+      return result.status === "changed"
+        ? { _tag: "Changed", value: result.value }
+        : { _tag: "Unchanged", value: result.value };
+    }
+    if (result.status === "value-mismatch") {
+      return result.value === undefined
+        ? { _tag: "ValueMismatch" }
+        : { _tag: "ValueMismatch", value: result.value };
+    }
+    if (result.status === "missing") return { _tag: "Missing" };
+    if (result.status === "generation-mismatch") return { _tag: "GenerationMismatch" };
+    return { _tag: "Busy" };
+  }
+
   private handleClient(socket: net.Socket): void {
     const client: Client = {
       socket,
@@ -1066,6 +1347,47 @@ export class PtyServer {
           case MessageType.STATUS: {
             const stats = this.collectStats();
             socket.write(encodeStatusResponse(JSON.stringify(stats)));
+            break;
+          }
+
+          case MessageType.ACCEPTED_SOCKET_OWNERSHIP: {
+            const request = decodeAcceptedSocketOwnershipRequest(jsonRecord(packet.payload));
+            if (request === undefined) {
+              socket.write(encodeAcceptedSocketOwnershipResponse({
+                _tag: "Unavailable",
+                reason: "invalid-request",
+              }));
+            } else {
+              void this.acceptedSocketOwnership(request).then((result) => {
+                if (!socket.destroyed) {
+                  socket.write(encodeAcceptedSocketOwnershipResponse(result));
+                }
+              });
+            }
+            break;
+          }
+
+          case MessageType.LIFECYCLE_CAS: {
+            const request = decodeLifecycleCompareAndSetRequest(jsonRecord(packet.payload));
+            const result = request === undefined
+              ? { _tag: "InvalidRequest" as const, reason: "invalid request payload" }
+              : this.compareAndSetLifecycle(request);
+            const deferDeadlineShutdown =
+              this.startupLeaseTerminalCause !== null &&
+              this.startupLeaseTerminalCause !== "exit" &&
+              !this.startupLeaseDeadlineNotified;
+            socket.write(
+              encodeLifecycleCompareAndSetResponse(result),
+              deferDeadlineShutdown
+                ? () => setImmediate(() => this.releaseStartupLeaseDeadlineResponse())
+                : undefined,
+            );
+            if (deferDeadlineShutdown) {
+              const shutdownBackstop = setTimeout(() => {
+                this.releaseStartupLeaseDeadlineResponse();
+              }, 2_000);
+              shutdownBackstop.unref();
+            }
             break;
           }
         }
@@ -1386,13 +1708,15 @@ export class PtyServer {
 
   /** Clean up resources. Does not call process.exit(). */
   close(options: { terminateDescendants?: boolean } = {}): Promise<void> {
-    if (options.terminateDescendants && this.shutdownDescendants.length === 0) {
-      try {
-        this.shutdownDescendants = snapshotDescendantProcesses(this.ptyProcess.pid);
-      } catch (error) {
+    if (options.terminateDescendants && !this.shutdownTreeSnapshotted) {
+      const snapshot = snapshotDescendantProcessesComplete(this.ptyProcess.pid);
+      this.shutdownTreeSnapshotted = true;
+      this.shutdownDescendants = snapshot.identities;
+      if (snapshot._tag === "Unavailable") {
+        this.shutdownTreeUnavailable = snapshot.reason;
         console.error(
-          `pty daemon "${this.name}": could not snapshot child processes: ` +
-          `${error instanceof Error ? error.message : String(error)}`,
+          `pty daemon "${this.name}": complete child snapshot unavailable: ${snapshot.reason}; ` +
+          `exact-signalling ${snapshot.identities.length} observed descendant(s) plus process-group fallback`,
         );
       }
     }
@@ -1420,10 +1744,18 @@ export class PtyServer {
           pid: process.pid,
         });
         try {
-          this.ptyProcess.kill();
+          if (this.startupLeaseDeadlineNotified) this.ptyProcess.kill("SIGKILL");
+          else this.ptyProcess.kill();
         } catch {}
+        const groupFallback = options.terminateDescendants && this.shutdownTreeUnavailable !== null
+          ? terminateProcessGroup(this.ptyProcess.pid, {
+            ...(this.startupLeaseDeadlineNotified ? { termWaitMs: 0 } : {}),
+          })
+          : Promise.resolve(true);
         const descendantsDone = options.terminateDescendants
-          ? terminateProcessIdentities(this.shutdownDescendants)
+          ? terminateProcessIdentities(this.shutdownDescendants, {
+            ...(this.startupLeaseDeadlineNotified ? { termWaitMs: 0 } : {}),
+          })
           : Promise.resolve([]);
         // Wait for the child's onExit to fire (which enqueues session_exit)
         // before draining the writer. Without this, SIGTERM-initiated
@@ -1442,6 +1774,13 @@ export class PtyServer {
           ]);
         }
         const survivingDescendants = await descendantsDone;
+        const processGroupGone = await groupFallback;
+        if (!processGroupGone) {
+          console.error(
+            `pty daemon "${this.name}": process-group fallback could not verify teardown ` +
+            `after incomplete snapshot (${this.shutdownTreeUnavailable})`,
+          );
+        }
         if (survivingDescendants.length > 0) {
           const pids = survivingDescendants.map((d) => d.pid);
           console.error(
@@ -1469,6 +1808,9 @@ export class PtyServer {
   forceKillChild(): void {
     try { this.ptyProcess.kill("SIGKILL"); } catch {}
     signalProcessIdentities(this.shutdownDescendants, "SIGKILL");
+    if (this.shutdownTreeUnavailable !== null) {
+      try { process.kill(-this.ptyProcess.pid, "SIGKILL"); } catch {}
+    }
   }
 }
 
@@ -1559,8 +1901,8 @@ if (process.argv[1]?.endsWith("/server.js")) {
   //     two would delete the evidence the operator killed the session to
   //     inspect. Keep.
   //
-  // `--ephemeral` remains the pre-existing aggressive opt-in and reaps on
-  // either path, so no existing caller of it regresses.
+  // Startup-lease generations always retain their terminal lifecycle and exit
+  // evidence; explicit evidence removal remains generation-fenced.
   let externalKill = false;
   function reapAtExit(): boolean {
     const metadata = readMetadata(config.name);
@@ -1570,6 +1912,7 @@ if (process.argv[1]?.endsWith("/server.js")) {
     ) {
       return false;
     }
+    if (config.startupLease) return false;
     if (externalKill && !isEphemeral) return false;
     const tags = metadata?.tags ?? config.tags;
     // `PTY_REAP_ON_EXIT` (network/global config) sets the default when no
@@ -1638,6 +1981,11 @@ if (process.argv[1]?.endsWith("/server.js")) {
     extraEnv: config.extraEnv,
     unsetEnv: config.unsetEnv,
     env: config.env,
+    startupLease: config.startupLease,
+    onStartupLeaseDeadline: () => {
+      externalKill = true;
+      void cleanShutdown(124);
+    },
     onExit: (code) => {
       // Give clients a moment to receive the exit message, then shut down
       setTimeout(() => cleanShutdown(code), 500);

@@ -428,6 +428,51 @@ export function mutateMetadataUnderLock(
   }
 }
 
+export type TagCompareAndSetResult =
+  | { status: "changed"; value: string }
+  | { status: "unchanged"; value: string }
+  | { status: "value-mismatch"; value?: string }
+  | { status: "busy" }
+  | { status: "missing" }
+  | { status: "generation-mismatch" }
+  | { status: "stale" };
+
+/** Generation-fenced compare-and-set for one exact tag value.
+ *
+ * This is the metadata primitive used by the daemon protocol. Callers that
+ * need a startup lease disarmed must use that live protocol rather than this
+ * filesystem helper, because the daemon owns the deadline timer. */
+export function compareAndSetTagValue(
+  name: string,
+  expectedGeneration: string,
+  tag: string,
+  expectedValue: string,
+  value: string,
+): TagCompareAndSetResult {
+  if (tag.length === 0) throw new Error("tag must not be empty");
+  let currentValue: string | undefined;
+  let matched = false;
+  const result = mutateMetadataUnderLock(name, (metadata) => {
+    currentValue = metadata.tags?.[tag];
+    if (currentValue !== expectedValue) return false;
+    matched = true;
+    if (currentValue === value) return false;
+    metadata.tags = { ...metadata.tags, [tag]: value };
+    return true;
+  }, { expectedGeneration });
+  if (
+    (result.status === "changed" || result.status === "unchanged") &&
+    !matched
+  ) {
+    return currentValue === undefined
+      ? { status: "value-mismatch" }
+      : { status: "value-mismatch", value: currentValue };
+  }
+  if (result.status === "changed") return { status: "changed", value };
+  if (result.status === "unchanged") return { status: "unchanged", value };
+  return result;
+}
+
 function validateMetadataPatch(patch: unknown): asserts patch is MetadataPatch {
   if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
     throw new Error("Metadata patch must be a JSON object.");

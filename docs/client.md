@@ -58,6 +58,63 @@ Invalid arguments and operational failures exit nonzero with a diagnostic on
 stderr. A reconciler should durably consume the snapshot before passing its
 opaque generation to `remove`; a mismatch must leave the replacement intact.
 
+### Accepted-socket ownership and lifecycle CAS
+
+`queryAcceptedSocketOwnership(name, request)` asks the live PTY daemon to prove
+that the accepted side of one exact held TCP connection belongs to the current
+child process or one of its descendants:
+
+```typescript
+const ownership = await queryAcceptedSocketOwnership("dev.web", {
+  expectedGeneration: generation,
+  connection: {
+    localAddress: socket.localAddress!,
+    localPort: socket.localPort!,
+    remoteAddress: socket.remoteAddress!,
+    remotePort: socket.remotePort!,
+  },
+});
+// { _tag: "Owned", pid } | { _tag: "NotOwned" } |
+// { _tag: "Unavailable", reason }
+```
+
+The caller must keep that exact connection open while querying. PTY reverses
+the client-observed 4-tuple to identify the server-side `ESTABLISHED` socket,
+then binds it to the exact current child identity and descendant tree. Inspection
+runs in a worker so procfs, `ps`, or `libproc` latency cannot stall the daemon's
+startup deadline timer. Linux uses procfs. Published packages include PTY's
+universal arm64/x86_64 Darwin helper; source installs may use a best-effort
+local build, and helper absence never fails package installation. Unsupported
+platforms, scoped IPv6 tuples, generation mismatch, process-tree or descriptor
+churn, unreadable or partial descriptor/socket tables, and helper failure return
+`Unavailable`; none are
+treated as `NotOwned`.
+
+`compareAndSetLifecycle(name, request)` compares and replaces one exact tag
+value through the live daemon:
+
+```typescript
+const result = await compareAndSetLifecycle("dev.web", {
+  expectedGeneration: generation,
+  tag: "run.lifecycle",
+  expectedValue: startingValue,
+  value: JSON.stringify({ _tag: "ready", generation }),
+});
+```
+
+Results are tagged: `Changed`, `Unchanged`, `ValueMismatch`, `Missing`,
+`GenerationMismatch`, `Busy`, `DeadlineExpired`, `Terminal`, or
+`InvalidRequest`. A replacement generation cannot be changed by a stale
+completion.
+
+The shell boundary reads the same typed request as one JSON object on stdin and
+emits exactly one tagged JSON result:
+
+```sh
+pty readiness ownership --id dev.web < ownership.json
+pty readiness cas --id dev.web < transition.json
+```
+
 ### `validateName(name: string): void`
 
 Throws if the name is invalid. Names must match `[a-zA-Z0-9._-]`, cannot be
@@ -224,6 +281,10 @@ interface SpawnDaemonOptions {
   extraEnv?: Record<string, string>; // explicit assignments applied last
   unsetEnv?: string[];               // inherited keys removed before assignments
   env?: Record<string, string>;      // exact child env; mutually exclusive with the above
+  startupLease?: {
+    timeoutMs: number;               // positive startup budget, converted once
+    lifecycleTag: string;            // exact tag carrying lifecycle JSON
+  };
 }
 ```
 
@@ -231,6 +292,24 @@ interface SpawnDaemonOptions {
 `PTY_SESSION` to the stable session id and fills an absent `TERM` with
 `xterm-256color`; naming either key in `unsetEnv` does not suppress those
 invariants. An explicit `extraEnv.TERM` value is preserved.
+
+When `startupLease` is present, the daemon atomically publishes the lifecycle
+tag as `{\"_tag\":\"starting\",\"generation\":\"…\",\"bootId\":\"…\",\"deadlineMonotonicNs\":\"…\"}`
+before `spawnDaemon()` resolves. The deadline is absolute in the named host-boot
+monotonic domain. Initiating caller exit cannot disarm or extend it. Only a
+successful live-daemon CAS away from that exact starting value disarms the
+timer. At expiry PTY first freezes and proves complete child containment. A
+complete observation records terminal cause `deadline` and terminates the exact
+child tree. An unavailable or partial observation instead records terminal
+cause `teardown-unavailable`, then best-effort signals every exact identity it
+did observe plus the root process group; it never claims exact teardown when
+containment is unknown. Both outcomes retain normal exit evidence. Child exit
+before readiness similarly records terminal cause `exit`. Startup-lease
+generations bypass ordinary daemon exit reaping so their terminal
+lifecycle and exit evidence survive child/daemon shutdown for generation-fenced
+consumption. A terminal value written by a successful current-generation
+CAS is retained through the resulting child and daemon shutdown rather than
+replaced by `exit`.
 
 ### `resolveCommand(cmd: string): string`
 

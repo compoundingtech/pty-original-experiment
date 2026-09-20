@@ -13,7 +13,7 @@ const cliSource = fs.readFileSync(path.join(__dirname, "..", "src", "cli.ts"), "
 const COMMANDS = [
   "run", "attach", "exec", "peek", "send", "events", "list", "stats",
   "restart", "kill", "recover", "rm", "gc", "tag", "tag-multi", "emit", "rename", "metadata",
-  "up", "down", "test", "remote-serve", "evidence",
+  "up", "down", "test", "remote-serve", "readiness", "evidence",
 ];
 // Aliases that must resolve to the same help.
 const ALIASES = ["a", "ls", "remove"];
@@ -66,6 +66,20 @@ describe("pty --help — per-subcommand help", () => {
       } else {
         expect(r.stdout).toContain("--expected-generation <opaque>");
       }
+    });
+  }
+
+  for (const leaf of ["ownership", "cas"] as const) {
+    it(`\`pty readiness ${leaf} --help\` prints leaf-specific help and exits 0`, () => {
+      const r = spawnSync(nodeBin, [cliPath, "readiness", leaf, "--help"], {
+        encoding: "utf8",
+        timeout: 15000,
+        env: { ...process.env, PTY_ROOT_LEGACY_SILENT: "1" },
+      });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stderr).toBe("");
+      expect(r.stdout).toMatch(new RegExp(`^Usage: pty readiness ${leaf} `));
+      expect(r.stdout).toContain("--id <stable-id>");
     });
   }
 });

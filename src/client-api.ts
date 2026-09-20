@@ -32,6 +32,7 @@ export {
 // Session interaction (CLI-oriented — uses process.stdin/stdout, may call process.exit)
 export {
   attach, peek, send, queryStats,
+  queryAcceptedSocketOwnership, compareAndSetLifecycle,
   TERMINAL_SANITIZE,
   type AttachOptions, type PeekOptions, type SendOptions,
   type StatsResult, type ProcessResources,
@@ -68,5 +69,8 @@ export { resolveKey, parseSeqValue } from "./keys.ts";
 // Protocol (advanced)
 export {
   PacketReader, MessageType,
-  type Packet,
+  type Packet, type TcpConnectionTuple,
+  type AcceptedSocketOwnershipRequest, type AcceptedSocketOwnershipResult,
+  type LifecycleCompareAndSetRequest, type LifecycleCompareAndSetResult,
 } from "./protocol.ts";
+export { type StartupLeaseOptions } from "./startup-lease.ts";

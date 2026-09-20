@@ -4,8 +4,10 @@ import * as path from "node:path";
 import * as readline from "node:readline/promises";
 import { spawnSync, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { attach, peek, send, queryStats, resolveSeqDelayMs, validateAttachStreamFdV1, type StatsResult,
-  isSessionAlive,
+import {
+  attach, peek, send, queryStats, resolveSeqDelayMs, validateAttachStreamFdV1,
+  isSessionAlive, queryAcceptedSocketOwnership, compareAndSetLifecycle,
+  type StatsResult,
 } from "./client.ts";
 import { printVersion } from "./version.ts";
 import { parseSeqValue } from "./keys.ts";
@@ -79,6 +81,10 @@ import {
   verifyRecoveryResult,
   type RecoveryResult,
 } from "./recovery.ts";
+import {
+  decodeAcceptedSocketOwnershipRequest,
+  decodeLifecycleCompareAndSetRequest,
+} from "./protocol.ts";
 
 // Name this process so it shows up meaningfully in ps/top/htop/btm instead of
 // "MainThread" (V8's default main-thread name under Node 24+). `process.title`
@@ -135,6 +141,10 @@ Flags:
   --tag keep=true      Exempt from reaping: keep metadata/logs after exit
   --cwd <path>         Working directory for the command
   --isolate-env        Scrub the child env to a safe allow-list (for remote-reachable sessions)
+  --startup-timeout-ms <ms>
+                       Arm a daemon-owned hard startup lease
+  --lifecycle-tag <key>
+                       Tag carrying the generation-fenced lifecycle value
   --force              Create even from inside another pty session (bypass the nesting guard)
 
 Examples:
@@ -434,6 +444,22 @@ Examples:
   printf '%s' '{"displayName":"Worker","tags":{"role":"worker"}}' | pty metadata patch --id a1b2c3d4
   printf '%s' '{"displayName":null,"tags":{"temporary":null}}' | pty metadata patch --id a1b2c3d4`,
 
+  readiness: `Usage: pty readiness ownership --id <stable-id>
+       pty readiness cas --id <stable-id>
+
+Machine-only readiness control for one exact live daemon generation. Both
+operations read one JSON object from stdin and emit one tagged JSON result.
+
+ownership input:
+  {"expectedGeneration":"<opaque>","connection":{"localAddress":"127.0.0.1","localPort":51000,"remoteAddress":"127.0.0.1","remotePort":3000}}
+
+cas input:
+  {"expectedGeneration":"<opaque>","tag":"run.lifecycle","expectedValue":"<exact>","value":"<exact>"}
+
+Examples:
+  pty readiness ownership --id a1b2c3d4 < ownership.json
+  pty readiness cas --id a1b2c3d4 < transition.json`,
+
   evidence: `Usage: pty evidence snapshot --id <stable-id>
        pty evidence remove --id <stable-id> --expected-generation <opaque>
 
@@ -471,6 +497,23 @@ Examples:
   pty test
   pty test -t "peek"`,
 };
+
+const READINESS_LEAF_HELP = {
+  ownership: `Usage: pty readiness ownership --id <stable-id>
+
+Read one exact-generation held TCP 4-tuple from stdin and emit one tagged
+Owned, NotOwned, or Unavailable JSON result.
+
+Example:
+  pty readiness ownership --id a1b2c3d4 < ownership.json`,
+  cas: `Usage: pty readiness cas --id <stable-id>
+
+Read one exact-generation, exact-value lifecycle tag compare-and-set from stdin
+and emit one tagged JSON result.
+
+Example:
+  pty readiness cas --id a1b2c3d4 < transition.json`,
+} as const;
 
 const EVIDENCE_LEAF_HELP = {
   snapshot: `Usage: pty evidence snapshot --id <stable-id>
@@ -520,6 +563,8 @@ Create sessions:
   pty run --cwd /path -- <command>        Run in a specific directory
   pty run --isolate-env -- <command>      Scrub the child env to a safe allow-list
                                           (intended for remote-reachable sessions)
+  pty run --startup-timeout-ms N --lifecycle-tag key ...
+                                          Arm a daemon-owned hard startup lease
   pty run --force -- <command>            Create even from inside another pty session (nested)
 
 Attach & interact:
@@ -562,6 +607,8 @@ Observe:
 Modify:
   pty metadata patch --id <id>            Atomically merge displayName/tags from JSON stdin
   pty evidence snapshot --id <id>         Read exact-generation retained exit evidence as JSON
+  pty readiness ownership --id <id>        Prove exact held TCP connection ownership
+  pty readiness cas --id <id>              Generation-fenced lifecycle tag CAS
   pty rename <label>                      Inside a session: set its displayName
   pty rename <ref> <label>                Outside: set displayName on <ref>
   pty rename --show <ref>                 Print the current displayName
@@ -809,6 +856,8 @@ async function main(): Promise<void> {
       const tags: Record<string, string> = {};
       const extraEnv: Record<string, string> = {};
       const unsetEnv: string[] = [];
+      let startupTimeoutMs: number | null = null;
+      let lifecycleTag: string | null = null;
       let i = 1;
       while (i < args.length && args[i] !== "--") {
         if (args[i] === "-d" || args[i] === "--detach") { detach = true; i++; }
@@ -820,6 +869,19 @@ async function main(): Promise<void> {
         else if (args[i] === "--id" && i + 1 < args.length) { explicitId = args[i + 1]; i += 2; }
         else if (args[i] === "--name" && i + 1 < args.length) { explicitDisplayName = args[i + 1]; i += 2; }
         else if (args[i] === "--cwd" && i + 1 < args.length) { cwd = args[i + 1]; i += 2; }
+        else if (args[i] === "--startup-timeout-ms" && i + 1 < args.length) {
+          const value = Number(args[i + 1]);
+          if (!Number.isSafeInteger(value) || value <= 0) {
+            console.error("pty run: --startup-timeout-ms requires a positive integer.");
+            process.exit(1);
+          }
+          startupTimeoutMs = value;
+          i += 2;
+        }
+        else if (args[i] === "--lifecycle-tag" && i + 1 < args.length) {
+          lifecycleTag = args[i + 1];
+          i += 2;
+        }
         else if (args[i] === "--tag" && i + 1 < args.length) {
           const eq = args[i + 1].indexOf("=");
           if (eq === -1) {
@@ -850,6 +912,16 @@ async function main(): Promise<void> {
         }
         else break;
         // Note: unknown flags or positional args before -- break the loop
+      }
+      if ((startupTimeoutMs === null) !== (lifecycleTag === null)) {
+        console.error(
+          "pty run: --startup-timeout-ms and --lifecycle-tag must be provided together.",
+        );
+        process.exit(1);
+      }
+      if (lifecycleTag === "") {
+        console.error("pty run: --lifecycle-tag must not be empty.");
+        process.exit(1);
       }
 
       // Everything after -- is the command
@@ -1011,6 +1083,7 @@ async function main(): Promise<void> {
       await cmdRun(
         name, cmd, cmdArgs, detach, attachExisting, displayCmd, ephemeral,
         tags, cwd, isolateEnv, displayName, extraEnv, unsetEnv,
+        startupTimeoutMs, lifecycleTag,
       );
       break;
     }
@@ -1653,6 +1726,11 @@ async function main(): Promise<void> {
       break;
     }
 
+
+    case "readiness": {
+      await cmdReadiness(args.slice(1));
+      break;
+    }
     case "rm":
     case "remove": {
       if (args.length < 2) {
@@ -1728,6 +1806,8 @@ async function cmdRun(
   displayName: string | null = null,
   extraEnv: Record<string, string> = {},
   unsetEnv: string[] = [],
+  startupTimeoutMs: number | null = null,
+  lifecycleTag: string | null = null,
 ): Promise<void> {
   let session = await getSessionByName(name);
 
@@ -1806,6 +1886,9 @@ async function cmdRun(
       ...(isolateEnv ? { isolateEnv: true } : {}),
       ...(extraEnvOpt && Object.keys(extraEnvOpt).length > 0 ? { extraEnv: extraEnvOpt } : {}),
       ...(unsetEnvOpt && unsetEnvOpt.length > 0 ? { unsetEnv: unsetEnvOpt } : {}),
+      ...(startupTimeoutMs !== null && lifecycleTag !== null
+        ? { startupLease: { timeoutMs: startupTimeoutMs, lifecycleTag } }
+        : {}),
     });
   } finally {
     if (ownsEventLock) releaseEventLock(name);
@@ -2964,9 +3047,55 @@ async function cmdMetadata(rawArgs: string[]): Promise<void> {
     const result = await patchMetadataById(id, patch as any);
     console.log(JSON.stringify(result));
   } catch (e) {
+
     console.error(`pty metadata patch: ${(e as Error).message}`);
     process.exit(1);
   }
+}
+async function cmdReadiness(rawArgs: string[]): Promise<void> {
+  const operation = rawArgs[0];
+  if (operation !== "ownership" && operation !== "cas") {
+    throw new Error('pty readiness: expected subcommand "ownership" or "cas".');
+  }
+  if (
+    rawArgs.length === 2 &&
+    (rawArgs[1] === "-h" || rawArgs[1] === "--help")
+  ) {
+    console.log(READINESS_LEAF_HELP[operation]);
+    return;
+  }
+  let id: string | null = null;
+  for (let i = 1; i < rawArgs.length; i++) {
+    if (rawArgs[i] !== "--id") {
+      throw new Error(`pty readiness ${operation}: unexpected argument "${rawArgs[i]}".`);
+    }
+    const value = rawArgs[++i];
+    if (!value) throw new Error(`pty readiness ${operation}: --id requires a stable session id.`);
+    if (id !== null) throw new Error(`pty readiness ${operation}: --id may only be provided once.`);
+    id = value;
+  }
+  if (id === null) throw new Error(`pty readiness ${operation}: missing required --id <stable-id>.`);
+
+  const input = fs.readFileSync(0, "utf8").trim();
+  if (input.length === 0) throw new Error(`pty readiness ${operation}: expected one JSON object on stdin.`);
+  let value: unknown;
+  try {
+    value = JSON.parse(input);
+  } catch (error) {
+    throw new Error(
+      `pty readiness ${operation}: invalid JSON on stdin: ` +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (operation === "ownership") {
+    const request = decodeAcceptedSocketOwnershipRequest(value);
+    if (!request) throw new Error("pty readiness ownership: invalid request object.");
+    fs.writeFileSync(1, `${JSON.stringify(await queryAcceptedSocketOwnership(id, request))}\n`);
+    return;
+  }
+  const request = decodeLifecycleCompareAndSetRequest(value);
+  if (!request) throw new Error("pty readiness cas: invalid request object.");
+  fs.writeFileSync(1, `${JSON.stringify(await compareAndSetLifecycle(id, request))}\n`);
 }
 
 async function cmdEvidence(rawArgs: string[]): Promise<void> {

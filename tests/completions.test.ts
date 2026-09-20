@@ -75,6 +75,21 @@ describe("completion spec parity with COMMAND_HELP", () => {
       ],
     });
   });
+
+  it("models readiness as ownership and CAS leaves with required ids", () => {
+    expect(COMMANDS.find((command) => command.name === "readiness")).toMatchObject({
+      subcommands: [
+        {
+          name: "ownership",
+          flags: [{ name: "id", argument: { _tag: "free" } }],
+        },
+        {
+          name: "cas",
+          flags: [{ name: "id", argument: { _tag: "free" } }],
+        },
+      ],
+    });
+  });
 });
 
 describe("pty completions <shell>", () => {

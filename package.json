@@ -21,9 +21,11 @@
   "files": [
     "bin/",
     "dist/",
+    "native/",
     "completions/",
     "docs/",
     "scripts/postinstall.js",
+    "scripts/build-darwin-socket-owner.js",
     "README.md",
     "LICENSE"
   ],
@@ -61,6 +63,8 @@
     "build": "tsc -p tsconfig.build.json",
     "prepublishOnly": "npm run build",
     "postinstall": "node scripts/postinstall.js",
+    "prepack": "node scripts/build-darwin-socket-owner.js",
+    "postpack": "node scripts/build-darwin-socket-owner.js --clean",
     "prepare": "git config core.hooksPath githooks 2>/dev/null || true; sh scripts/update-nix-hash.sh 2>/dev/null || true",
     "install-completions": "sh scripts/install-completions.sh",
     "typecheck": "tsc",

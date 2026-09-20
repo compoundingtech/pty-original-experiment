@@ -45,11 +45,13 @@ export type Unknown =
 export type Answer<T> =
   | { readonly kind: "known"; readonly value: T }
   | { readonly kind: "not-present" }
-  | { readonly kind: "unknown"; readonly reason: Unknown };
+  | { readonly kind: "unknown"; readonly reason: Unknown; readonly partial?: T };
 
 export const known = <T>(value: T): Answer<T> => ({ kind: "known", value });
 export const notPresent = <T>(): Answer<T> => ({ kind: "not-present" });
-export const unknown = <T>(reason: Unknown): Answer<T> => ({ kind: "unknown", reason });
+export const unknown = <T>(reason: Unknown, partial?: T): Answer<T> => (
+  partial === undefined ? { kind: "unknown", reason } : { kind: "unknown", reason, partial }
+);
 
 /** The value if the table knew it. Silence and absence both yield null, so
  *  this is for callers that have decided the difference does not matter. */
@@ -205,18 +207,26 @@ class DirectSource implements ProcessSource {
       return unknown("table-unreadable");
     }
     const out: Row[] = [];
+    let incomplete: Unknown | null = null;
     for (const name of names) {
       if (!/^\d+$/.test(name)) continue;
       const pid = Number(name);
       try {
         const row = parseProcStat(pid, fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
         if (row) out.push(row);
-      } catch {
-        // Exited between the readdir and the read. That is a real absence.
+        else incomplete = "field-empty";
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        // An exited process is absent. Permission and malformed-I/O failures
+        // make a whole-tree answer incomplete, but preserve all safely observed
+        // rows so teardown can still exact-signal visible out-of-group children.
+        if (code !== "ENOENT" && code !== "ESRCH") incomplete = "table-unreadable";
       }
     }
-    if (!out.some((r) => r.pid === process.pid)) return unknown("table-unreadable");
-    return known(out);
+    if (!out.some((r) => r.pid === process.pid)) {
+      return unknown("table-unreadable", out);
+    }
+    return incomplete === null ? known(out) : unknown(incomplete, out);
   }
 }
 

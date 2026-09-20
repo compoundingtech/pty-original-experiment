@@ -85,6 +85,16 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: "cwd", desc: "Working directory" },
       { name: "isolate-env", desc: "Scrub env to a safe allow-list" },
       { name: "force", desc: "Create even from inside another pty" },
+      {
+        name: "startup-timeout-ms",
+        desc: "Daemon-owned startup deadline in milliseconds",
+        argument: { _tag: "free", name: "milliseconds" },
+      },
+      {
+        name: "lifecycle-tag",
+        desc: "Generation-fenced lifecycle tag key",
+        argument: { _tag: "free", name: "key" },
+      },
     ],
   },
   {
@@ -251,6 +261,30 @@ const COMMANDS: readonly CommandSpec[] = [
     desc: "Atomically patch presentation metadata by stable id",
     flags: [{ name: "id", desc: "Exact stable session id" }],
     positionalValues: ["patch"],
+  },
+  {
+    name: "readiness",
+    desc: "Exact socket ownership and lifecycle compare-and-set",
+    subcommands: [
+      {
+        name: "ownership",
+        desc: "Prove accepted socket ownership for one held connection",
+        flags: [{
+          name: "id",
+          desc: "Exact stable session id",
+          argument: { _tag: "free", name: "id" },
+        }],
+      },
+      {
+        name: "cas",
+        desc: "Compare-and-set one lifecycle tag value",
+        flags: [{
+          name: "id",
+          desc: "Exact stable session id",
+          argument: { _tag: "free", name: "id" },
+        }],
+      },
+    ],
   },
   {
     name: "evidence",

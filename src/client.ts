@@ -11,7 +11,13 @@ import {
   encodePeek,
   encodeResize,
   encodeStatus,
+  encodeAcceptedSocketOwnershipRequest,
+  encodeLifecycleCompareAndSetRequest,
   decodeExit,
+  type AcceptedSocketOwnershipRequest,
+  type AcceptedSocketOwnershipResult,
+  type LifecycleCompareAndSetRequest,
+  type LifecycleCompareAndSetResult,
 } from "./protocol.ts";
 import { getSocketPath } from "./sessions.ts";
 import { stripAnsi } from "./tui/colors.ts";
@@ -409,6 +415,136 @@ export function queryStats(name: string, timeoutMs = 2000): Promise<StatsResult>
       }
     });
   });
+}
+
+const requestControlJson = <TResult>(
+  name: string,
+  type: typeof MessageType.ACCEPTED_SOCKET_OWNERSHIP | typeof MessageType.LIFECYCLE_CAS,
+  packet: Buffer,
+  decode: (value: unknown) => TResult | undefined,
+  timeoutMs: number,
+): Promise<TResult> => new Promise<TResult>((resolve, reject) => {
+  const socket = net.createConnection(getSocketPath(name));
+  const reader = new PacketReader();
+  const timer = setTimeout(() => {
+    socket.destroy();
+    reject(new Error(`Timeout querying readiness control for "${name}"`));
+  }, timeoutMs);
+  socket.on("connect", () => socket.write(packet));
+  socket.on("data", (data: Buffer) => {
+    let packets;
+    try {
+      packets = reader.feed(data);
+    } catch (error) {
+      clearTimeout(timer);
+      socket.destroy();
+      reject(error);
+      return;
+    }
+    for (const response of packets) {
+      if (response.type !== type) continue;
+      let value: unknown;
+      try {
+        value = JSON.parse(response.payload.toString("utf8"));
+      } catch {
+        value = undefined;
+      }
+      const result = decode(value);
+      clearTimeout(timer);
+      socket.destroy();
+      if (result === undefined) {
+        reject(new Error(`Invalid readiness control response from "${name}"`));
+      } else {
+        resolve(result);
+      }
+      return;
+    }
+  });
+  socket.on("error", (error) => {
+    clearTimeout(timer);
+    reject(error);
+  });
+});
+
+const taggedRecord = (value: unknown): Record<string, unknown> | undefined =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+
+const decodeOwnershipResult = (value: unknown): AcceptedSocketOwnershipResult | undefined => {
+  const result = taggedRecord(value);
+  if (
+    result?._tag === "Owned" &&
+    typeof result.pid === "number" &&
+    Number.isSafeInteger(result.pid) &&
+    result.pid > 0
+  ) {
+    return { _tag: "Owned", pid: result.pid };
+  }
+  if (result?._tag === "NotOwned") return { _tag: "NotOwned" };
+  if (result?._tag === "Unavailable" && typeof result.reason === "string") {
+    return { _tag: "Unavailable", reason: result.reason };
+  }
+  return undefined;
+};
+
+const decodeLifecycleResult = (value: unknown): LifecycleCompareAndSetResult | undefined => {
+  const result = taggedRecord(value);
+  if (!result || typeof result._tag !== "string") return undefined;
+  if (
+    (result._tag === "Changed" ||
+      result._tag === "Unchanged" ||
+      result._tag === "DeadlineExpired" ||
+      result._tag === "Terminal") &&
+    typeof result.value === "string"
+  ) return { _tag: result._tag, value: result.value };
+  if (result._tag === "ValueMismatch") {
+    return typeof result.value === "string"
+      ? { _tag: "ValueMismatch", value: result.value }
+      : { _tag: "ValueMismatch" };
+  }
+  if (
+    result._tag === "Missing" ||
+    result._tag === "GenerationMismatch" ||
+    result._tag === "Busy"
+  ) return { _tag: result._tag };
+  if (result._tag === "InvalidRequest" && typeof result.reason === "string") {
+    return { _tag: "InvalidRequest", reason: result.reason };
+  }
+  return undefined;
+};
+
+/** Ask the live daemon whether the accepted side of this exact held TCP
+ * connection belongs to its current child process tree. */
+export function queryAcceptedSocketOwnership(
+  name: string,
+  request: AcceptedSocketOwnershipRequest,
+  timeoutMs = 2_000,
+): Promise<AcceptedSocketOwnershipResult> {
+  return requestControlJson(
+    name,
+    MessageType.ACCEPTED_SOCKET_OWNERSHIP,
+    encodeAcceptedSocketOwnershipRequest(request),
+    decodeOwnershipResult,
+    timeoutMs,
+  );
+}
+
+/** Compare-and-set one tag through the current daemon generation. A successful
+ * transition away from its exact starting value is the only operation that can
+ * disarm a startup lease. */
+export function compareAndSetLifecycle(
+  name: string,
+  request: LifecycleCompareAndSetRequest,
+  timeoutMs = 2_000,
+): Promise<LifecycleCompareAndSetResult> {
+  return requestControlJson(
+    name,
+    MessageType.LIFECYCLE_CAS,
+    encodeLifecycleCompareAndSetRequest(request),
+    decodeLifecycleResult,
+    timeoutMs,
+  );
 }
 
 export interface AttachOptions {

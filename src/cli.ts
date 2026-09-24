@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 import { attach, peek, send, queryStats, resolveSeqDelayMs, validateAttachStreamFdV1, type StatsResult,
   isSessionAlive,
 } from "./client.ts";
+import { plainLabel, renderLabel, renderTags, shortPath, strategyMarker } from "./session-presentation.ts";
 import { printVersion } from "./version.ts";
 import { parseSeqValue } from "./keys.ts";
 import {
@@ -62,9 +63,9 @@ import {
   emitUserEvent,
 } from "./events.ts";
 import { readPtyFile, type PtySessionDef } from "./ptyfile.ts";
-import { extractFilterTags as extractFilterTagsImpl, matchesAllTags, isReservedTagKey } from "./tags.ts";
+import { extractFilterTags as extractFilterTagsImpl, matchesAllTags } from "./tags.ts";
 import { parseDuration, formatDuration } from "./duration.ts";
-import { serveRemoteControl, runRemoteServeStdio, fetchRemoteList, dialAndRoute, RouteRefusedError, PTY_REMOTE_ALPN, FABRIC_BIN } from "./remote.ts";
+import { serveRemoteControl, runRemoteServeStdio, fetchRemoteList, dialPeer, routeSocket, dialAndRoute, RouteRefusedError, PTY_REMOTE_ALPN, FABRIC_BIN, type RemoteSessionRow } from "./remote.ts";
 import {
   RECOVERY_PROTOCOL,
   assertPrivateRecoveryPaths,
@@ -1907,8 +1908,13 @@ async function handleDeadSession(
 }
 
 function doAttach(name: string, attachStreamFdV1?: number): void {
+  const metadata = readMetadata(name);
+  if (attachStreamFdV1 === undefined) {
+    process.stderr.write(`[attached to ${plainLabel({ name, displayName: metadata?.displayName })} — press Ctrl+\\ to detach]\n`);
+  }
   attach({
     name,
+    metadata,
     ...(attachStreamFdV1 !== undefined ? { attachStreamFdV1 } : {}),
     onDetach: () => process.exit(0),
     onExit: (code) => process.exit(code),
@@ -2058,6 +2064,7 @@ async function cmdPeek(name: string, follow: boolean, plain: boolean, full = fal
 
   peek({
     name,
+    metadata: session?.metadata,
     follow,
     plain,
     full,
@@ -2077,14 +2084,19 @@ async function cmdPeekRemote(
   full: boolean,
 ): Promise<void> {
   let socket;
+  let row: RemoteSessionRow | undefined;
   try {
-    socket = await dialAndRoute(peer, name);
+    const socketPath = dialPeer(peer);
+    row = follow ? await fetchPeerRow(socketPath, name) : undefined;
+    socket = await routeSocket(socketPath, name);
   } catch (e) {
     console.error(`pty peek --remote ${peer}: ${(e as Error).message}`);
     process.exit(1);
   }
   peek({
     name,
+    row,
+    peer,
     follow,
     plain,
     full,
@@ -2120,19 +2132,37 @@ async function cmdSendRemote(
   });
 }
 
+// Query before opening the routed socket: otherwise the daemon can send its
+// first packet while the CLI awaits metadata and no client listener exists.
+async function fetchPeerRow(socketPath: string, name: string): Promise<RemoteSessionRow | undefined> {
+  try {
+    return (await fetchRemoteList(socketPath)).find((row) => row.name === name);
+  } catch {
+    return undefined;
+  }
+}
+
 /** `pty attach --remote <peer> <name>`: dial the peer's exposed pty control
  *  socket over fabric, route it to the named remote session, and attach over
  *  that tunnel — the resilient shell is a long-lived remote pty you attach to. */
 async function cmdAttachRemote(peer: string, name: string, attachStreamFdV1?: number): Promise<void> {
   let socket;
+  let row: RemoteSessionRow | undefined;
   try {
-    socket = await dialAndRoute(peer, name);
+    const socketPath = dialPeer(peer);
+    row = await fetchPeerRow(socketPath, name);
+    socket = await routeSocket(socketPath, name);
   } catch (e) {
     console.error(`pty attach --remote ${peer}: ${(e as Error).message}`);
     process.exit(1);
   }
+  if (attachStreamFdV1 === undefined) {
+    process.stderr.write(`[attached to ${plainLabel({ name, displayName: row?.displayName })} — press Ctrl+\\ to detach]\n`);
+  }
   attach({
     name,
+    row,
+    peer,
     socket,
     ...(attachStreamFdV1 !== undefined ? { attachStreamFdV1 } : {}),
     // On a loud fabric close, re-dial + re-route to the same remote session and
@@ -2395,28 +2425,6 @@ async function cmdList(opts: ListOptions = {}): Promise<void> {
   const exited = sessions.filter((s) => s.status === "exited");
   const vanished = sessions.filter((s) => s.status === "vanished");
 
-  // Render tags as hashtags. When `showAll` is false, hide reserved keys
-  // (pty-internal bookkeeping like `ptyfile*`/`strategy`, plus any key
-  // starting with `:` which is the tool-owned-tag convention — e.g.,
-  // pty-layout's `:l<pid>-<rand>` view membership markers). `--tags`
-  // (showAll=true) shows everything.
-  const renderTags = (tags: Record<string, string> | undefined, showAll: boolean): string => {
-    if (!tags) return "";
-    const entries = Object.entries(tags).filter(([k]) => showAll || !isReservedTagKey(k));
-    return entries.length > 0 ? " " + entries.map(([k, v]) => `#${k}=${v}`).join(" ") : "";
-  };
-
-  // Render the session's primary label. If displayName is set, it appears
-  // first with the stable id in parens for disambiguation; otherwise just
-  // the id. Users can match either in any CLI command.
-  const renderLabel = (session: SessionInfo, boldCode: string): string => {
-    const dn = session.metadata?.displayName;
-    if (dn) {
-      return `${boldCode}${dn}\x1b[0m \x1b[2m(${session.name})\x1b[0m`;
-    }
-    return `${boldCode}${session.name}\x1b[0m`;
-  };
-
   if (running.length > 0) {
     console.log("Active sessions:");
     for (const session of running) {
@@ -2428,7 +2436,7 @@ async function cmdList(opts: ListOptions = {}): Promise<void> {
         : "";
       const tagStr = renderTags(session.metadata?.tags, showTags);
       const marker = strategyMarker(session.metadata?.tags);
-      const label = renderLabel(session, "\x1b[1;36m");
+      const label = renderLabel(session.name, session.metadata?.displayName, "\x1b[1;36m");
       console.log(`  ${label}${marker}${tagStr} (pid: ${session.pid}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
@@ -2446,7 +2454,7 @@ async function cmdList(opts: ListOptions = {}): Promise<void> {
         : "";
       const tagStr = renderTags(meta?.tags, showTags);
       const marker = strategyMarker(meta?.tags);
-      const label = renderLabel(session, "\x1b[1m");
+      const label = renderLabel(session.name, session.metadata?.displayName, "\x1b[1m");
       console.log(`  ${label}${marker}${tagStr} (exited with code ${code}, ${ago}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
@@ -2465,7 +2473,7 @@ async function cmdList(opts: ListOptions = {}): Promise<void> {
       const cmd = meta ? meta.displayCommand : "";
       const tagStr = renderTags(meta?.tags, showTags);
       const marker = strategyMarker(meta?.tags);
-      const label = renderLabel(session, "\x1b[1;33m");
+      const label = renderLabel(session.name, session.metadata?.displayName, "\x1b[1;33m");
       console.log(`  \u26a0 ${label}${marker}${tagStr} (vanished, started ${ago}) — ${cwd} — \x1b[2m${cmd}\x1b[0m`);
     }
   }
@@ -4213,24 +4221,6 @@ function clearFlappingBookkeeping(
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-function strategyMarker(tags?: Record<string, string>): string {
-  if (!tags) return "";
-  // Flapping supersedes permanent visually because it's what changed the
-  // operator's expectation ("gc stopped respawning this on purpose").
-  // Rendered red so it stands out from the yellow [permanent].
-  if (tags["strategy.status"] === "flapping") {
-    return " \x1b[31m[flapping]\x1b[0m";
-  }
-  if (tags.strategy === "permanent") return " \x1b[33m[permanent]\x1b[0m";
-  return "";
-}
-
-function shortPath(p: string): string {
-  const home = os.homedir();
-  if (p === home) return "~";
-  if (p.startsWith(home + "/")) return "~" + p.slice(home.length);
-  return p;
-}
 
 function timeAgo(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);

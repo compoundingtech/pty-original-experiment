@@ -195,26 +195,20 @@ export function runRemoteServeStdio(): void {
   process.stdin.resume();
 }
 
-/** Dial a fabric peer's exposed pty control socket and route it to a specific
- *  remote session. The resolved socket is a transparent pipe to that session's
- *  daemon socket, ready for the ordinary per-session protocol (attach/peek/send
- *  client code runs over it unchanged). */
-export function dialAndRoute(peer: string, name: string, timeoutMs = 10000): Promise<net.Socket> {
+/** Resolve the peer's control socket before starting any routed session stream. */
+export function dialPeer(peer: string, timeoutMs = 10000): string {
+  const dialSock = execFileSync(FABRIC_BIN, ["dial", peer, PTY_REMOTE_ALPN], {
+    encoding: "utf-8",
+    timeout: timeoutMs,
+  }).trim();
+  if (!dialSock) throw new Error(`fabric dial ${peer} returned no socket`);
+  return dialSock;
+}
+
+/** Route a dialed control socket to a remote session. Install client listeners
+ * immediately after this promise resolves: the route is already live. */
+export function routeSocket(dialSock: string, name: string, timeoutMs = 10000): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
-    let dialSock: string;
-    try {
-      dialSock = execFileSync(FABRIC_BIN, ["dial", peer, PTY_REMOTE_ALPN], {
-        encoding: "utf-8",
-        timeout: timeoutMs,
-      }).trim();
-    } catch (e) {
-      reject(e instanceof Error ? e : new Error(String(e)));
-      return;
-    }
-    if (!dialSock) {
-      reject(new Error(`fabric dial ${peer} returned no socket`));
-      return;
-    }
     const sock = net.createConnection(dialSock);
     let acked = false;
     let buf: Buffer = Buffer.alloc(0);
@@ -261,6 +255,11 @@ export function dialAndRoute(peer: string, name: string, timeoutMs = 10000): Pro
       if (!acked) reject(new Error(`remote session "${name}" not reachable`));
     });
   });
+}
+
+/** Dial and route when no metadata lookup is needed (send and reconnect). */
+export async function dialAndRoute(peer: string, name: string, timeoutMs = 10000): Promise<net.Socket> {
+  return routeSocket(dialPeer(peer, timeoutMs), name, timeoutMs);
 }
 
 /** Connect to a control socket (a local path, or one handed to us by

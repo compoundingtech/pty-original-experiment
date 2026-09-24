@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Attach and follow trailers identify the session
+
+- Detaching from `pty attach` or `pty peek -f` now prints the stable session id,
+  its display name, cwd, command and visible tags, followed by an actionable
+  reattach command. Session exits include the runtime and a restart hint only
+  when the registry retains the session. Remote attach hints include the peer.
+- When a daemon closes its socket without an exit packet (for example after
+  `pty kill`), attach and follow-mode peek now say that the session ended,
+  including the same summary but no restart hint. A client-rejected malformed
+  frame remains a connection error, not a session-end announcement.
+- Attach banners include the display name when available. Machine attach
+  streams remain framed, with no new stderr output on detach or EXIT.
+
 ### `pty metadata patch` waits out the attach window
 
 - An attached child starts while `pty run` still holds the per-session

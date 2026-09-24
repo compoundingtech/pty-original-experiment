@@ -13,7 +13,10 @@ import {
   encodeStatus,
   decodeExit,
 } from "./protocol.ts";
-import { getSocketPath } from "./sessions.ts";
+import { getSocketPath, readMetadata, reapOnExitDefault, shouldReapAtExit, type SessionMetadata } from "./sessions.ts";
+import { formatDuration } from "./duration.ts";
+import { sessionSummary, type SessionPresentation } from "./session-presentation.ts";
+import type { RemoteSessionRow } from "./remote.ts";
 import { stripAnsi } from "./tui/colors.ts";
 import { BRACKETED_PASTE_START, BRACKETED_PASTE_END } from "./paste.ts";
 
@@ -81,6 +84,45 @@ export const TERMINAL_SANITIZE =
 // "[detached]") appear below the session content, not mid-screen.
 const CURSOR_TO_BOTTOM = "\x1b[999;1H";
 
+export interface TrailerSource {
+  name: string;
+  metadata?: SessionMetadata | null;
+  row?: RemoteSessionRow;
+  peer?: string;
+}
+
+const trailerInfo = (source: TrailerSource): SessionPresentation | undefined => {
+  if (source.peer) {
+    if (!source.row) return undefined;
+    return { name: source.name, displayName: source.row.displayName, cwd: source.row.cwd,
+      displayCommand: source.row.command, tags: source.row.tags };
+  }
+  const meta = readMetadata(source.name) ?? source.metadata;
+  if (!meta) return undefined;
+  return { name: source.name, displayName: meta.displayName, cwd: meta.cwd,
+    displayCommand: meta.displayCommand, tags: meta.tags, createdAt: meta.createdAt,
+    ephemeral: meta.ephemeral };
+};
+
+export const trailer = (
+  source: TrailerSource,
+  header: string,
+  hint?: string,
+  plain = false,
+  sanitize = true,
+): string => {
+  const info = trailerInfo(source);
+  const lines = [header, ...(info ? [sessionSummary(info)] : []), ...(hint ? [`  ${hint}`] : [])];
+  const body = lines.map((line) => plain ? stripAnsi(line) : line).join("\r\n") + "\r\n";
+  return (sanitize ? TERMINAL_SANITIZE + CURSOR_TO_BOTTOM : "") + "\r\n" + body;
+};
+
+export const exitHeader = (name: string, code: number, info?: SessionPresentation): string => {
+  const created = info?.createdAt ? Date.parse(info.createdAt) : NaN;
+  const elapsed = Number.isFinite(created) ? ` after ${formatDuration(Math.max(0, Date.now() - created))}` : "";
+  return `[${name} exited with code ${code}${elapsed}]`;
+};
+
 export interface PeekOptions {
   name: string;
   follow?: boolean; // If true, stay connected and stream (like tail -f). If false, print screen and exit.
@@ -93,6 +135,9 @@ export interface PeekOptions {
    *  control-server-routed socket that transparently pipes to the remote
    *  session's daemon. When set, `name` is only used for display. */
   socket?: net.Socket;
+  metadata?: SessionMetadata | null;
+  row?: RemoteSessionRow;
+  peer?: string;
 }
 
 /** Read-only view of a session. Input is ignored by the server. */
@@ -101,6 +146,8 @@ export function peek(options: PeekOptions): void {
   const socket = options.socket ?? net.createConnection(getSocketPath(options.name));
   const stdout = process.stdout;
   const follow = options.follow ?? false;
+  let completed = false;
+  let failed = false;
 
   const onReady = () => {
     socket.write(encodePeek(options.plain, options.full));
@@ -115,8 +162,11 @@ export function peek(options: PeekOptions): void {
         for (let i = 0; i < data.length; i++) {
           if (data[i] === DETACH_KEY) {
             if (stdin.isTTY) stdin.setRawMode(false);
+            completed = true;
             socket.destroy();
-            stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + "\r\n[detached]\r\n");
+            stdout.write(trailer(options, `[detached from ${options.name}]`,
+              `reattach: pty peek -f ${options.peer ? `--remote ${options.peer} ` : ""}${options.name}`,
+              options.plain));
             options.onDetach?.();
             return;
           }
@@ -141,6 +191,7 @@ export function peek(options: PeekOptions): void {
   socket.on("data", (data: Buffer) => {
     let packets;
     try { packets = reader.feed(data); } catch (err: any) {
+      failed = true;
       console.error(`pty client: dropping connection — ${err.message}`);
       try { socket.destroy(); } catch {}
       return;
@@ -155,6 +206,7 @@ export function peek(options: PeekOptions): void {
               stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM);
             }
             stdout.write("\n");
+            completed = true;
             socket.destroy();
             return;
           }
@@ -168,12 +220,16 @@ export function peek(options: PeekOptions): void {
 
         case MessageType.EXIT: {
           const code = decodeExit(packet.payload);
+          completed = true;
           socket.destroy();
           if (!options.plain) {
             stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM);
           }
           if (follow) {
-            stdout.write(`\r\n[${options.name} exited with code ${code}]\r\n`);
+            const info = trailerInfo(options);
+            const restart = !options.peer && info && !shouldReapAtExit(info.tags, info.ephemeral ?? false, reapOnExitDefault());
+            stdout.write(trailer(options, exitHeader(options.name, code, info),
+              restart ? `restart: pty attach ${options.name}` : undefined, options.plain, false));
           }
           options.onExit?.(code);
           return;
@@ -183,6 +239,7 @@ export function peek(options: PeekOptions): void {
   });
 
   socket.on("error", (err: NodeJS.ErrnoException) => {
+    failed = true;
     // ECONNRESET/EPIPE also mean "gone": a `--remote` route to a missing session
     // has the control server close the tunnel as we write the first frame.
     const notReachable = err.code === "ENOENT" || err.code === "ECONNREFUSED"
@@ -202,6 +259,12 @@ export function peek(options: PeekOptions): void {
   socket.on("close", () => {
     if (process.stdin.isTTY && process.stdin.isRaw) {
       process.stdin.setRawMode(false);
+    }
+    if (follow && !completed && !failed) {
+      completed = true;
+      stdout.write(trailer(options, `[${options.name} session ended]`,
+        undefined, options.plain, !options.plain));
+      options.onExit?.(0);
     }
     // Closed in one-shot mode before any screen — the (possibly remote) session
     // isn't reachable. Don't exit 0 with no output.
@@ -433,6 +496,9 @@ export interface AttachOptions {
    *  descriptor. stdin/stdout remain the controlling terminal for input and
    *  geometry; terminal output is emitted only as framed protocol packets. */
   attachStreamFdV1?: number;
+  metadata?: SessionMetadata | null;
+  row?: RemoteSessionRow;
+  peer?: string;
 }
 
 /** Validate a dedicated inherited descriptor without taking ownership of it. */
@@ -480,6 +546,7 @@ export function attach(options: AttachOptions): void {
   let detaching = false;
   let rawWasSet = false;
   let exitCode = 0;
+  let protocolFailed = false;
   let exitHandled = false;
   let exitCompleted = false;
   let sessionExited = false; // saw an EXIT packet — the session really ended; don't reconnect
@@ -540,7 +607,8 @@ export function attach(options: AttachOptions): void {
     } else {
       try { socket.write(encodeDetach()); } catch {}
       cleanExit();
-      stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + "\r\n[detached]\r\n");
+      stdout.write(trailer(options, `[detached from ${options.name}]`,
+        `reattach: pty attach ${options.peer ? `--remote ${options.peer} ` : ""}${options.name}`));
       completeDetach();
     }
   }
@@ -611,6 +679,7 @@ export function attach(options: AttachOptions): void {
     let packets;
     try { packets = reader.feed(data); }
     catch (err: any) {
+      protocolFailed = true;
       console.error(`pty client: dropping connection — ${err.message}`);
       try { socket.destroy(); } catch {}
       return;
@@ -674,7 +743,11 @@ export function attach(options: AttachOptions): void {
         case MessageType.EXIT:
           exitCode = decodeExit(packet.payload);
           sessionExited = true; // real exit — never reconnect past it
-          stdout.write(TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} exited with code ${exitCode}]\r\n`);
+          const info = trailerInfo(options);
+          const restart = !options.peer && info && !shouldReapAtExit(info.tags, info.ephemeral ?? false, reapOnExitDefault());
+          cleanExit();
+          stdout.write(trailer(options, exitHeader(options.name, exitCode, info),
+            restart ? `restart: pty attach ${options.name}` : undefined));
           finish(exitCode);
           return;
       }
@@ -707,6 +780,10 @@ export function attach(options: AttachOptions): void {
         console.error("pty attach: machine stream truncated before EXIT: connection closed");
         finish(1);
       } else {
+        if (!sessionExited && !protocolFailed) {
+          cleanExit();
+          stdout.write(trailer(options, `[${options.name} session ended]`));
+        }
         finish(exitCode);
       }
     }
@@ -714,6 +791,7 @@ export function attach(options: AttachOptions): void {
 
   function bindSocket(s: net.Socket, preConnected: boolean): void {
     reader = new PacketReader();
+    protocolFailed = false;
     machineInitialState = "geometry";
     if (streamBackpressured) s.pause();
     s.on("data", handleData);
@@ -744,9 +822,10 @@ export function attach(options: AttachOptions): void {
         // (Transport failures resolve null, so we keep retrying below.)
         if (detaching || exitHandled) break;
         reconnecting = false;
+        cleanExit();
         status.write(attachStream
           ? `[${options.name} session ended]\n`
-          : TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name} session ended]\r\n`);
+          : trailer(options, `[${options.name} session ended]`));
         finish(attachStream ? 1 : 0);
         return;
       }
@@ -762,9 +841,11 @@ export function attach(options: AttachOptions): void {
       // ends it (besides the user's Ctrl-\ / Ctrl-C).
       if (++attempt >= RECONNECT_MAX_ATTEMPTS) {
         reconnecting = false;
+        cleanExit();
         status.write(attachStream
-          ? `[${options.name}: connection lost — re-run \`pty attach --remote\` to reconnect]\n`
-          : TERMINAL_SANITIZE + CURSOR_TO_BOTTOM + `\r\n[${options.name}: connection lost — re-run \`pty attach --remote\` to reconnect]\r\n`);
+          ? `[connection lost to ${options.name}]\n`
+          : trailer(options, `[connection lost to ${options.name}]`,
+            `reconnect: pty attach --remote ${options.peer} ${options.name}`));
         finish(1);
         return;
       }

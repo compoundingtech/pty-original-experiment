@@ -7,7 +7,7 @@ import { execFileSync, spawn as spawnChild, spawnSync } from "node:child_process
 import { attach } from "../client.ts";
 import {
   listSessions,
-  cleanupAll, getSession, getSessionDir, type SessionInfo,
+  cleanupAll, getSession, getSessionDir, readMetadata, type SessionInfo,
 } from "../sessions.ts";
 import { spawnDaemon, spawnDaemonWithCreationLock } from "../spawn.ts";
 import { matchesAllTags, isReservedTagKey } from "../tags.ts";
@@ -592,6 +592,7 @@ function doAttach(name: string): void {
   pauseApp();
   attach({
     name,
+    metadata: readMetadata(name) ?? sessions.peek().find((session) => session.name === name)?.metadata,
     onDetach: async () => {
       // Preserve filter + in-bounds selection so the user returns to the
       // overview where they were. Closes #27. The selection clamps when

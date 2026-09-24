@@ -161,6 +161,21 @@ describe("attach --remote reconnect harness", () => {
     }
   }, 25000);
 
+  it("shows the remote peer in the detach hint and the dial-time session row", async () => {
+    const session = Session.spawn(nodeBin, [cliPath, "attach", "--remote", "testpeer", "rshell"], {
+      rows: 24, cols: 80,
+      env: { PTY_ROOT: cliRoot, PTY_ROOT_LEGACY_SILENT: "1", PTY_FABRIC_BIN: fakeFabric },
+    });
+    try {
+      await session.waitForText("RECONNECT_READY", 8000);
+      session.sendKeys("\x1c");
+      await session.waitForText("reattach: pty attach --remote testpeer rshell", 8000);
+      await session.waitForText("rshell)", 8000);
+    } finally {
+      await session.close();
+    }
+  }, 20000);
+
   it("survives a tunnel drop: re-dials, re-attaches, and resumes without exiting", async () => {
     const session = Session.spawn(nodeBin, [cliPath, "attach", "--remote", "testpeer", "rshell"], {
       rows: 24, cols: 80,

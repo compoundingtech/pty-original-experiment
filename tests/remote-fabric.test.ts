@@ -155,7 +155,7 @@ describe("pty ls --remote over fabric", () => {
   }, 15000);
 
   it("ignores SIGHUP and keeps serving (the detached-launch death on Linux)", async () => {
-    // The Hetzner failure: a detached launch is killed by the SIGHUP its
+    // The Linux failure: a detached launch is killed by the SIGHUP its
     // launching session sends on teardown (SIGHUP's default action terminates).
     // remote-serve must ignore it. Deterministic everywhere — POSIX SIGHUP.
     const sock = path.join(os.tmpdir(), `pr-hup-${rand()}.sock`);

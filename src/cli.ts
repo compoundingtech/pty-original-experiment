@@ -162,7 +162,7 @@ Examples:
   pty attach myserver
   pty attach -r myserver
   pty attach --no-restart myserver
-  pty attach --remote hetzner myshell`,
+  pty attach --remote example-host myshell`,
 
   exec: `Usage: pty exec -- <command> [args...]
 
@@ -188,7 +188,7 @@ Flags:
 
 Examples:
   pty peek --plain myserver
-  pty peek --remote hetzner myserver
+  pty peek --remote example-host myserver
   pty peek --wait "Listening" -t 10 --plain myserver`,
 
   send: `Usage: pty send <ref> "text"
@@ -212,7 +212,7 @@ Flags:
 Examples:
   pty send myserver "hello"
   pty send myserver --seq "git status" --seq key:return        # 0.3s gap by default
-  pty send --remote hetzner myserver --seq "ls" --seq key:return`,
+  pty send --remote example-host myserver --seq "ls" --seq key:return`,
 
   events: `Usage: pty events [--all | <ref>] [--recent] [--json] [--wait <type> [-t <sec>]]
 
@@ -247,7 +247,7 @@ Flags:
 
 Examples:
   pty list
-  pty list --remote hetzner
+  pty list --remote example-host
   pty list --filter-tag role=web --json`,
 
   "remote-serve": `Usage: pty remote-serve (--stdio | --socket <path>)
@@ -967,9 +967,8 @@ async function main(): Promise<void> {
         // liveness check in `spawn.ts` exists to prevent, one command earlier.
         //
         // The Rust tool asks `session_exists(name) && client::is_alive(name)`
-        // here. This is the same question. Measured on a Mac by Silber.pty on
-        // 2026-09-03: with a zombie owner, Rust created a replacement in 186 ms
-        // and Node exited 1.
+        // here. This is the same question. Measured on a Mac: with a zombie
+        // owner, Rust created a replacement in 186 ms and Node exited 1.
         if (existingNames.has(explicitId) && !attachExisting && await isSessionAlive(explicitId)) {
           console.error(`Session id "${explicitId}" is already in use.`);
           process.exit(1);

@@ -150,7 +150,7 @@ describe("against the real machine", () => {
   // An unreaped child must never read as running. **The two platforms reach
   // that answer differently, and this asserts the answer.** On Linux the corpse
   // keeps a row with state Z. On macOS `ps` stops listing it the moment it
-  // exits. Measured on a real Mac by Silber.pty on 2026-09-03.
+  // exits. Measured on a real Mac.
   it("never reports an unreaped child as running", async () => {
     const sh = spawn("sh", ["-c", "sleep 0.1 & echo $! ; kill -STOP $$"], {
       stdio: ["ignore", "pipe", "ignore"],

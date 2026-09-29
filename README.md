@@ -71,7 +71,7 @@ pty metadata patch --id myserver < patch.json # atomically patch displayName/tag
 pty list                                  # show active sessions (tags shown by default)
 pty list --tags                           # include internal bookkeeping tags (ptyfile*, strategy, etc.)
 pty list --json                           # show as JSON
-pty list --remote hetzner                 # list a fabric peer's sessions (over fabric)
+pty list --remote example-host            # list a fabric peer's sessions (over fabric)
 pty list --remote                         # include remote sessions via pty-relay
 pty list --filter-tag role=web            # show only sessions with matching tag (repeatable)
 

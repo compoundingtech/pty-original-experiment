@@ -119,7 +119,7 @@ describe("the sweep against real processes", () => {
     // **macOS has the `setsid` system call but no `setsid` executable.** An
     // earlier version of this test spawned the binary, so on the one platform
     // where process groups are the whole escalation story, the test could not
-    // run at all. Reported from a real Mac by Silber.pty on 2026-09-03.
+    // run at all. Reported from a real Mac.
     const child = spawn("sh", ["-c", "trap '' TERM; sleep 60 & sleep 60"], {
       stdio: "ignore",
       detached: true,

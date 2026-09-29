@@ -8,7 +8,7 @@ import { buildSpawnEnv } from "../src/testing/session.ts";
 
 describe("buildSpawnEnv (Session.spawn env isolation)", () => {
   it("always scrubs PTY_SESSION and PTY_SERVER_CONFIG", () => {
-    const env = buildSpawnEnv({ PTY_SESSION: "silber.pty", PTY_SERVER_CONFIG: "{}", HOME: "/h" });
+    const env = buildSpawnEnv({ PTY_SESSION: "example.pty", PTY_SERVER_CONFIG: "{}", HOME: "/h" });
     expect(env.PTY_SESSION).toBeUndefined();
     expect(env.PTY_SERVER_CONFIG).toBeUndefined();
     expect(env.HOME).toBe("/h"); // unrelated vars pass through

@@ -27,7 +27,7 @@ function makeHost(label: string, sessions: { name: string; command?: string; cwd
       name: s.name,
       status: "running",
       command: s.command ?? "bash",
-      cwd: s.cwd ?? "/home/user",
+      cwd: s.cwd ?? "/home/example",
     })),
     spawn_enabled,
     error: null,

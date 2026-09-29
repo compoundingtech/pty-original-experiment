@@ -237,7 +237,7 @@ async function spawnViaNode(options: SpawnDaemonOptions, serverModule: string): 
       // still starting up — the loop spends the whole start timeout and then
       // reports a timeout, when the true answer was on disk in the first pass.
       //
-      // Measured on a Mac by Silber.pty on 2026-09-03: the losing `pty run`
+      // Measured on a Mac: the losing `pty run`
       // took 30.06 s against a 30 s budget and said "Timed out waiting for
       // daemon publication" instead of "is already running".
       // **NOT `isProcessAlive`.** A zombie answers `kill(pid, 0)`, so the cheap

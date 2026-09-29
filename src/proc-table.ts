@@ -149,8 +149,7 @@ export function processOf(pid: number): Answer<Row> {
   // `ps` prints — so a live process read as "field-empty" and a zombie read as
   // NOT EXITED, which would make the teardown wait out its whole budget for a
   // corpse. That is the corpse defect again, reintroduced on macOS by a second
-  // parsing path that Linux never exercised. Found on a real Mac by
-  // `Silber.pty` on 2026-09-03.
+  // parsing path that Linux never exercised. Found on a real Mac.
   //
   // `parsePsListing` splits lines first and checks that the row for the pid we
   // asked about is actually there, so both jobs are done by the code that was
